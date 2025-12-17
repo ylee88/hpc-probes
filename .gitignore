@@ -1,0 +1,25 @@
+# Editor / OS noise
+*~
+*.swp
+*.swo
+*.bak
+.DS_Store
+Thumbs.db
+
+# Executable is always assumed to be *.x
+*.x
+
+# Generic build artifacts
+build/
+build-*/
+*.o
+*.mod
+*.obj
+*.a
+*.so
+*.dylib
+
+# Debug / profiling output
+*.ncu-rep
+*.nsys-rep
+*.sqlite
