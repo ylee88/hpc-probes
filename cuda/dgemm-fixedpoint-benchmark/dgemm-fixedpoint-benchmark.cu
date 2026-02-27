@@ -92,6 +92,8 @@ static void usage(const char* prog) {
       << "  --m M --n N --k K                 GEMM sizes (default 4096 4096 4096)\n"
       << "  --iters I                         Timed iterations (default 50)\n"
       << "  --warmup W                        Warmup iterations (default 10)\n"
+      << "  --batched 0|1                     Use cublasDgemmBatched (default 0)\n"
+      << "  --batch_count B                   Number of GEMMs for batched mode (default 1)\n"
       << "  --workspace_mb MB                 Workspace size for cublasSetWorkspace (default auto)\n"
       << "  --mantissa_control dyn|fixed      (default fixed)\n"
       << "  --max_mantissa_bits B             (default 55; library default for fixed is 55) \n"
@@ -125,6 +127,8 @@ static void print_cublas_info(cublasHandle_t h) {
 int main(int argc, char** argv) {
   int m = 1024, n = 1024, k = 1024;
   int iters = 50, warmup = 10;
+  int batched = 0;
+  int batch_count = 1;
 
   // Default: fixed mantissa control with 55 bits (doc default for fixed).
   cudaEmulationMantissaControl_t mantissaControl = CUDA_EMULATION_MANTISSA_CONTROL_FIXED;
@@ -145,6 +149,8 @@ int main(int argc, char** argv) {
     else if (a == "--k") k = std::stoi(need("--k"));
     else if (a == "--iters") iters = std::stoi(need("--iters"));
     else if (a == "--warmup") warmup = std::stoi(need("--warmup"));
+    else if (a == "--batched") batched = std::stoi(need("--batched"));
+    else if (a == "--batch_count") batch_count = std::stoi(need("--batch_count"));
     else if (a == "--workspace_mb") workspace_mb = std::stoi(need("--workspace_mb"));
     else if (a == "--mantissa_control") {
       auto v = need("--mantissa_control");
@@ -157,10 +163,21 @@ int main(int argc, char** argv) {
     else { std::cerr << "Unknown arg: " << a << "\n"; usage(argv[0]); return 1; }
   }
 
+  if (batched != 0 && batched != 1) {
+    std::cerr << "--batched must be 0 or 1\n";
+    return 1;
+  }
+  if (batch_count <= 0) {
+    std::cerr << "--batch_count must be > 0\n";
+    return 1;
+  }
+  const int effective_batch_count = batched ? batch_count : 1;
+
   // Prints the configurations
   std::cout << "DGEMM fixed-point emulation benchmark via cublasGemmEx, column-major\n";
   std::cout << "M,N,K = " << m << "," << n << "," << k
             << " | warmup=" << warmup << " iters=" << iters << "\n";
+  std::cout << "batched=" << batched << " batch_count=" << effective_batch_count << "\n";
   std::cout << "mantissa_control="
             << (mantissaControl == CUDA_EMULATION_MANTISSA_CONTROL_DYNAMIC ? "dyn" : "fixed")
             << " max_mantissa_bits=" << maxMantissaBits
@@ -169,22 +186,69 @@ int main(int argc, char** argv) {
   print_device_info();
 
   // Host buffers
-  std::vector<double> hA((size_t)m * k), hB((size_t)k * n);
-  std::vector<double> hC0((size_t)m * n, 0.0);
+  const size_t a_elems_per_batch = (size_t)m * (size_t)k;
+  const size_t b_elems_per_batch = (size_t)k * (size_t)n;
+  const size_t c_elems_per_batch = (size_t)m * (size_t)n;
+  const size_t total_a_elems = a_elems_per_batch * (size_t)effective_batch_count;
+  const size_t total_b_elems = b_elems_per_batch * (size_t)effective_batch_count;
+  const size_t total_c_elems = c_elems_per_batch * (size_t)effective_batch_count;
+
+  std::vector<double> hA(total_a_elems), hB(total_b_elems);
+  std::vector<double> hC0(total_c_elems, 0.0);
   fill_random(hA, 1234);
   fill_random(hB, 5678);
 
   // Device buffers
   double *dA = nullptr, *dB = nullptr, *dC = nullptr;
-  check_cuda(cudaMalloc((void**)&dA, sizeof(double) * (size_t)m * k), "cudaMalloc dA");
-  check_cuda(cudaMalloc((void**)&dB, sizeof(double) * (size_t)k * n), "cudaMalloc dB");
-  check_cuda(cudaMalloc((void**)&dC, sizeof(double) * (size_t)m * n), "cudaMalloc dC");
-  check_cuda(cudaMemcpy(dA, hA.data(), sizeof(double) * (size_t)m * k, cudaMemcpyHostToDevice),
+  check_cuda(cudaMalloc((void**)&dA, sizeof(double) * total_a_elems), "cudaMalloc dA");
+  check_cuda(cudaMalloc((void**)&dB, sizeof(double) * total_b_elems), "cudaMalloc dB");
+  check_cuda(cudaMalloc((void**)&dC, sizeof(double) * total_c_elems), "cudaMalloc dC");
+  check_cuda(cudaMemcpy(dA, hA.data(), sizeof(double) * total_a_elems, cudaMemcpyHostToDevice),
              "cudaMemcpy A H2D");
-  check_cuda(cudaMemcpy(dB, hB.data(), sizeof(double) * (size_t)k * n, cudaMemcpyHostToDevice),
+  check_cuda(cudaMemcpy(dB, hB.data(), sizeof(double) * total_b_elems, cudaMemcpyHostToDevice),
              "cudaMemcpy B H2D");
-  check_cuda(cudaMemcpy(dC, hC0.data(), sizeof(double) * (size_t)m * n, cudaMemcpyHostToDevice),
+  check_cuda(cudaMemcpy(dC, hC0.data(), sizeof(double) * total_c_elems, cudaMemcpyHostToDevice),
              "cudaMemcpy C0 H2D");
+
+  double** dAarray = nullptr;
+  double** dBarray = nullptr;
+  double** dCarray = nullptr;
+  if (batched) {
+    std::vector<double*> hAarray((size_t)effective_batch_count);
+    std::vector<double*> hBarray((size_t)effective_batch_count);
+    std::vector<double*> hCarray((size_t)effective_batch_count);
+    for (int i = 0; i < effective_batch_count; ++i) {
+      hAarray[(size_t)i] = dA + ((size_t)i * a_elems_per_batch);
+      hBarray[(size_t)i] = dB + ((size_t)i * b_elems_per_batch);
+      hCarray[(size_t)i] = dC + ((size_t)i * c_elems_per_batch);
+    }
+
+    check_cuda(cudaMalloc((void**)&dAarray, sizeof(double*) * (size_t)effective_batch_count),
+               "cudaMalloc dAarray");
+    check_cuda(cudaMalloc((void**)&dBarray, sizeof(double*) * (size_t)effective_batch_count),
+               "cudaMalloc dBarray");
+    check_cuda(cudaMalloc((void**)&dCarray, sizeof(double*) * (size_t)effective_batch_count),
+               "cudaMalloc dCarray");
+
+    check_cuda(cudaMemcpy(
+                   dAarray,
+                   hAarray.data(),
+                   sizeof(double*) * (size_t)effective_batch_count,
+                   cudaMemcpyHostToDevice),
+               "cudaMemcpy Aarray H2D");
+    check_cuda(cudaMemcpy(
+                   dBarray,
+                   hBarray.data(),
+                   sizeof(double*) * (size_t)effective_batch_count,
+                   cudaMemcpyHostToDevice),
+               "cudaMemcpy Barray H2D");
+    check_cuda(cudaMemcpy(
+                   dCarray,
+                   hCarray.data(),
+                   sizeof(double*) * (size_t)effective_batch_count,
+                   cudaMemcpyHostToDevice),
+               "cudaMemcpy Carray H2D");
+  }
 
   cublasHandle_t handle;
   check_cublas(cublasCreate(&handle), "cublasCreate");
@@ -218,7 +282,11 @@ int main(int argc, char** argv) {
     workspace_bytes = (size_t)workspace_mb * 1024ull * 1024ull;
   } else {
     workspace_bytes = getFixedPointWorkspaceSizeInBytes(
-        m, n, k, /*batchCount*/ 1, /*isComplex*/ false, mantissaControl, maxMantissaBits);
+        m, n, k,
+        /*batchCount*/ effective_batch_count,
+        /*isComplex*/ false,
+        mantissaControl,
+        maxMantissaBits);
   }
   void* dWorkspace = nullptr;
   check_cuda(cudaMalloc(&dWorkspace, workspace_bytes), "cudaMalloc workspace");
@@ -232,18 +300,46 @@ int main(int argc, char** argv) {
 
   // Helper function to run a single GEMM with a given compute type.
   auto do_gemm = [&](cublasComputeType_t computeType) {
-    check_cublas(cublasGemmEx(
-        handle,
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        m, n, k,
-        &alpha,
-        dA, CUDA_R_64F, lda,
-        dB, CUDA_R_64F, ldb,
-        &beta,
-        dC, CUDA_R_64F, ldc,
-        computeType,
-        CUBLAS_GEMM_DEFAULT),
-        "cublasGemmEx");
+    (void)computeType;
+    if (batched) {
+      check_cublas(
+          cublasDgemmBatched(
+              handle,
+              CUBLAS_OP_N, CUBLAS_OP_N,
+              m, n, k,
+              &alpha,
+              (const double**)dAarray, lda,
+              (const double**)dBarray, ldb,
+              &beta,
+              dCarray, ldc,
+              effective_batch_count),
+          "cublasDgemmBatched");
+    } else {
+      // check_cublas(
+      //     cublasGemmEx(
+      //         handle,
+      //         CUBLAS_OP_N, CUBLAS_OP_N,
+      //         m, n, k,
+      //         &alpha,
+      //         dA, CUDA_R_64F, lda,
+      //         dB, CUDA_R_64F, ldb,
+      //         &beta,
+      //         dC, CUDA_R_64F, ldc,
+      //         computeType,
+      //         CUBLAS_GEMM_DEFAULT),
+      //     "cublasGemmEx");
+      check_cublas(
+          cublasDgemm(
+              handle,
+              CUBLAS_OP_N, CUBLAS_OP_N,
+              m, n, k,
+              &alpha,
+              dA, lda,
+              dB, ldb,
+              &beta,
+              dC, ldc),
+          "cublasDgemm");
+    }
   };
 
   cudaEvent_t start, stop;
@@ -256,7 +352,7 @@ int main(int argc, char** argv) {
   // Validate emulation engagement via retained_mantissa_bits below.
   constexpr cublasComputeType_t COMPUTE_TYPE = CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT;
 
-  check_cuda(cudaMemcpy(dC, hC0.data(), sizeof(double) * (size_t)m * n, cudaMemcpyHostToDevice),
+  check_cuda(cudaMemcpy(dC, hC0.data(), sizeof(double) * total_c_elems, cudaMemcpyHostToDevice),
              "cudaMemcpy reset C H2D");
   {
     int32_t init = -1;
@@ -278,15 +374,15 @@ int main(int argc, char** argv) {
   check_cuda(cudaEventElapsedTime(&ms, start, stop), "cudaEventElapsedTime");
 
   double avg_ms = ms / (double)iters;
-  double flops = 2.0 * (double)m * (double)n * (double)k;
+  double flops = 2.0 * (double)m * (double)n * (double)k * (double)effective_batch_count;
   double tsec = avg_ms * 1e-3;
   double tflops = (flops / tsec) / 1e12;
   int32_t mantissa_used = -999;
   check_cuda(cudaMemcpy(&mantissa_used, d_mantissa_used, sizeof(int32_t), cudaMemcpyDeviceToHost),
              "cudaMemcpy mantissa_used D2H");
 
-  std::vector<double> hC((size_t)m * n);
-  check_cuda(cudaMemcpy(hC.data(), dC, sizeof(double) * (size_t)m * n, cudaMemcpyDeviceToHost),
+  std::vector<double> hC(total_c_elems);
+  check_cuda(cudaMemcpy(hC.data(), dC, sizeof(double) * total_c_elems, cudaMemcpyDeviceToHost),
              "cudaMemcpy C D2H");
   double checksum = checksum_sum(hC);
 
@@ -304,6 +400,9 @@ int main(int argc, char** argv) {
 
   // Cleanup
   check_cublas(cublasDestroy(handle), "cublasDestroy");
+  if (dAarray) check_cuda(cudaFree(dAarray), "cudaFree dAarray");
+  if (dBarray) check_cuda(cudaFree(dBarray), "cudaFree dBarray");
+  if (dCarray) check_cuda(cudaFree(dCarray), "cudaFree dCarray");
   check_cuda(cudaFree(dWorkspace), "cudaFree workspace");
   check_cuda(cudaFree(d_mantissa_used), "cudaFree d_mantissa_used");
   check_cuda(cudaFree(dA), "cudaFree dA");
